@@ -362,13 +362,19 @@ def gen_xml_v43(inv, sale_conditions, total_servicio_gravado,
                 fecha_emision_referencia, codigo_referencia, razon_referencia):
 
     numero_linea = 0
+    payment_methods_id = []
 
     if inv._name == 'pos.order':
         plazo_credito = '0'
-        payment_methods_id = '01'
+        inv_statement_length = len(inv.statement_ids)
+        for statement_counter in range(inv_statement_length):
+            if inv.statement_ids[statement_counter].statement_id.journal_id.type == 'cash':
+                payment_methods_id.append('01')
+            else:
+                payment_methods_id.append('02')
         cod_moneda = str(inv.company_id.currency_id.name)
     else:
-        payment_methods_id = str(inv.payment_methods_id.sequence)
+        payment_methods_id.append(str(inv.payment_methods_id.sequence))
         plazo_credito = str(inv.invoice_payment_term_id and inv.invoice_payment_term_id.line_ids[0].days or 0)
         cod_moneda = str(inv.currency_id.name)
 
@@ -481,7 +487,9 @@ def gen_xml_v43(inv, sale_conditions, total_servicio_gravado,
 
     sb.Append('<CondicionVenta>' + sale_conditions + '</CondicionVenta>')
     sb.Append('<PlazoCredito>' + plazo_credito + '</PlazoCredito>')
-    sb.Append('<MedioPago>' + payment_methods_id + '</MedioPago>')
+    payment_method_length = len(payment_methods_id)
+    for payment_method_counter in range(payment_method_length):
+        sb.Append('<MedioPago>' + payment_methods_id[payment_method_counter] + '</MedioPago>')
     sb.Append('<DetalleServicio>')
 
     detalle_factura = lines
@@ -496,6 +504,9 @@ def gen_xml_v43(inv, sale_conditions, total_servicio_gravado,
         if inv.tipo_documento == 'FEE' and v.get('partidaArancelaria'):
             sb.Append('<PartidaArancelaria>' + str(v['partidaArancelaria']) + '</PartidaArancelaria>')
 
+        if v.get('codigoCabys'):
+            sb.Append('<Codigo>' + (v['codigoCabys']) + '</Codigo>')
+        
         if v.get('codigo'):
             sb.Append('<CodigoComercial>')
             sb.Append('<Tipo>04</Tipo>')
@@ -849,21 +860,19 @@ def consulta_documentos(self, inv, env, token_m_h, date_cr, xml_firmado):
 
     # Siempre sin importar el estado se actualiza la fecha de acuerdo a la devuelta por Hacienda y
     # se carga el xml devuelto por Hacienda
-    last_state = False
+    last_state = inv.state_tributacion
+    inv.state_tributacion = estado_m_h
     if inv.type == 'out_invoice' or inv.type == 'out_refund':
         # Se actualiza el estado con el que devuelve Hacienda
-        last_state = inv.state_tributacion
-        inv.state_tributacion = estado_m_h
         inv.date_issuance = date_cr
         if xml_firmado:
             inv.fname_xml_comprobante = 'comprobante_' + inv.number_electronic + '.xml'
             inv.xml_comprobante = xml_firmado
     elif inv.type == 'in_invoice' or inv.type == 'in_refund':
-        last_state = inv.state_send_invoice
         if xml_firmado:
             inv.fname_xml_comprobante = 'receptor_' + inv.number_electronic + '.xml'
             inv.xml_comprobante = xml_firmado
-        inv.state_send_invoice = estado_m_h
+        
 
     # Si fue aceptado o rechazado por haciendo se carga la respuesta
     if (estado_m_h == 'aceptado' or estado_m_h == 'rechazado') or (
@@ -875,11 +884,9 @@ def consulta_documentos(self, inv, env, token_m_h, date_cr, xml_firmado):
     if inv.tipo_documento != 'FEC' and estado_m_h == 'aceptado' and (last_state is False or last_state == 'procesando'):
         # if not inv.partner_id.opt_out:
         if inv.type == 'in_invoice' or inv.type == 'in_refund':
-            email_template = self.env.ref(
-                'cr_electronic_invoice.email_template_invoice_vendor', False)
+            email_template = self.env.ref('cr_electronic_invoice.email_template_invoice_vendor', False)
         else:
-            email_template = self.env.ref(
-                'account.email_template_edi_invoice', False)
+            email_template = self.env.ref('account.email_template_edi_invoice', False)
 
         attachments = []
 
@@ -976,12 +983,12 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
 
         invoice.number_electronic = invoice_xml.xpath("inv:Clave", namespaces=namespaces)[0].text
         activity_node = invoice_xml.xpath("inv:CodigoActividad", namespaces=namespaces)
+        activity_id = False
         activity = False
         if activity_node:
-            activity_id = activity_node[0].text
-            activity = invoice.env['economic.activity'].with_context(active_test=False).search([('code', '=', activity_id)], limit=1)
-        else:
-            activity_id = False
+            activity = invoice.env['economic.activity'].with_context(active_test=False).search([('code', '=', activity_node[0].text)], limit=1)
+            activity_id = activity.id
+            
         invoice.economic_activity_id = activity
         invoice.date_issuance = invoice_xml.xpath("inv:FechaEmision", namespaces=namespaces)[0].text
         invoice.invoice_date = invoice.date_issuance
@@ -1000,7 +1007,6 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
             invoice.currency_id = invoice.env['res.currency'].search([('name', '=', 'CRC')], limit=1).id
 
         partner = invoice.env['res.partner'].search([('vat', '=', emisor),
-                                                    ('supplier', '=', True),
                                                     '|',
                                                      ('company_id', '=', invoice.company_id.id),
                                                      ('company_id', '=', False)],
@@ -1012,7 +1018,7 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
             raise UserError(_('The provider in the invoice does not exists. Please review it.'))
 
         invoice.account_id = partner.property_account_payable_id
-        invoice.payment_term_id = partner.property_supplier_payment_term_id
+        invoice.invoice_payment_term_id = partner.property_supplier_payment_term_id
 
         payment_method_node = invoice_xml.xpath("inv:MedioPago", namespaces=namespaces)
         if payment_method_node:
@@ -1023,11 +1029,20 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
 
         _logger.debug('MAB - load_lines: %s - account: %s' %
                       (load_lines, account_id))
+        
+        product = False
+        if product_id:
+            product = product_id
+
+        analytic_account = False
+        if analytic_account_id:
+            analytic_account = analytic_account_id.id
+
 
         # if load_lines and not invoice.invoice_line_ids:
         if load_lines:
             lines = invoice_xml.xpath("inv:DetalleServicio/inv:LineaDetalle", namespaces=namespaces)
-            new_lines = invoice.env['account.move.line']
+            new_lines = []
             for line in lines:
                 product_uom = invoice.env['uom.uom'].search(
                     [('code', '=', line.xpath("inv:UnidadMedida", namespaces=namespaces)[0].text)],
@@ -1080,8 +1095,21 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
                     if tax:
                         total_tax += float(tax_node.xpath("inv:Monto", namespaces=namespaces)[0].text)
 
-                        # TODO: Add exonerations
-                        taxes.append((4, tax.id))
+                        exonerations = tax_node.xpath("inv:Exoneracion", namespaces=namespaces)
+                        if exonerations:
+                            for exoneration_node in exonerations:
+                                exoneration_percentage = float(exoneration_node.xpath("inv:PorcentajeExoneracion", namespaces=namespaces)[0].text)
+                                tax = invoice.env['account.tax'].search(
+                                [('percentage_exoneration', '=', exoneration_percentage),
+                                ('type_tax_use', '=', 'purchase'),
+                                ('non_tax_deductible', '=', False),
+                                ('has_exoneration', '=', True),
+                                ('active', '=', True)],
+                                limit=1)
+                                taxes.append((4, tax.id))
+                        else:
+                            taxes.append((4, tax.id))
+
                     else:
                         if product_id and product_id.non_tax_deductible:
                             raise UserError(_('Tax code %s and percentage %s as non-tax deductible is not registered in the system' % (tax_code, tax_amount)))
@@ -1089,28 +1117,23 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
                             raise UserError(_('Tax code %s and percentage %s is not registered in the system' % (tax_code, tax_amount)))
 
                 _logger.debug('MAB - impuestos de linea: %s' % (taxes))
-                invoice_line = invoice.env['account.move.line'].create({
+                columns = {
                     'name': line.xpath("inv:Detalle", namespaces=namespaces)[0].text,
-                    'invoice_id': invoice.id,
+                    'move_id': invoice.id,
                     'price_unit': line.xpath("inv:PrecioUnitario", namespaces=namespaces)[0].text,
                     'quantity': line.xpath("inv:Cantidad", namespaces=namespaces)[0].text,
                     'product_uom_id': product_uom,
                     'sequence': line.xpath("inv:NumeroLinea", namespaces=namespaces)[0].text,
                     'discount': discount_percentage,
                     'discount_note': discount_note,
-                    # 'total_amount': total_amount,
-                    'product_id': product_id.id or False,
-                    'account_id': account_id.id or False,
-                    'analytic_account_id': analytic_account_id.id or False,
-                    'amount_untaxed': float(line.xpath("inv:SubTotal", namespaces=namespaces)[0].text),
-                    'total_tax': total_tax,
-                })
-
-                # This must be assigned after line is created
-                invoice_line.tax_ids = taxes
-                invoice_line.economic_activity_id = activity
-                new_lines += invoice_line
-
+                    'product_id': product,
+                    'account_id': account_id.id,
+                    'analytic_account_id': analytic_account,
+                    'economic_activity_id': activity_id,
+                    'tax_ids': taxes,
+                }
+                new_lines.append((0, 0, columns))
+            
             invoice.invoice_line_ids = new_lines
 
         invoice.amount_total_electronic_invoice = invoice_xml.xpath("inv:ResumenFactura/inv:TotalComprobante", namespaces=namespaces)[0].text
@@ -1118,5 +1141,5 @@ def load_xml_data(invoice, load_lines, account_id, product_id=False, analytic_ac
         tax_node = invoice_xml.xpath("inv:ResumenFactura/inv:TotalImpuesto", namespaces=namespaces)
         if tax_node:
             invoice.amount_tax_electronic_invoice = tax_node[0].text
-
-        invoice.compute_taxes()
+        
+        invoice._compute_amount()
